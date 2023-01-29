@@ -1,20 +1,28 @@
 /*
  * spidev_module.c - Python bindings for Linux SPI access through spidev
+ *
+ * MIT License
+ *
  * Copyright (C) 2009 Volker Thoms <unconnected@gmx.de>
  * Copyright (C) 2012 Stephen Caudle <scaudle@doceme.com>
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; version 2 of the License.
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  */
 
 #include <Python.h>
@@ -27,8 +35,16 @@
 #include <sys/ioctl.h>
 #include <linux/ioctl.h>
 
-#define _VERSION_ "3.3"
+#define _VERSION_ "3.6"
 #define SPIDEV_MAXPATH 4096
+
+#define BLOCK_SIZE_CONTROL_FILE "/sys/module/spidev/parameters/bufsiz"
+// The xfwr3 function attempts to use large blocks if /sys/module/spidev/parameters/bufsiz setting allows it.
+// However where we cannot get a value from that file, we fall back to this safe default.
+#define XFER3_DEFAULT_BLOCK_SIZE SPIDEV_MAXPATH
+// Largest block size for xfer3 - even if /sys/module/spidev/parameters/bufsiz allows bigger
+// blocks, we won't go above this value. As I understand, DMA is not used for anything bigger so why bother.
+#define XFER3_MAX_BLOCK_SIZE 65535
 
 
 #if PY_MAJOR_VERSION < 3
@@ -44,7 +60,39 @@
 #define PyInt_Type			PyLong_Type
 #endif
 
-//#define SPIDEV_SINGLE	1
+// Maximum block size for xfer3
+// Initialised once by get_xfer3_block_size
+uint32_t xfer3_block_size = 0;
+
+// Read maximum block size from the /sys/module/spidev/parameters/bufsiz
+// In case of any problems reading the number, we fall back to XFER3_DEFAULT_BLOCK_SIZE.
+// If number is read ok but it exceeds the XFER3_MAX_BLOCK_SIZE, it will be capped to that value.
+// The value is read and cached on the first invocation. Following invocations just return the cached one.
+uint32_t get_xfer3_block_size(void) {
+	int value;
+
+	// If value was already initialised, just use it
+	if (xfer3_block_size != 0) {
+		return xfer3_block_size;
+	}
+
+	// Start with the default
+	xfer3_block_size = XFER3_DEFAULT_BLOCK_SIZE;
+
+	FILE *file = fopen(BLOCK_SIZE_CONTROL_FILE,"r");
+	if (file != NULL) {
+		if (fscanf(file, "%d", &value) == 1 && value > 0) {
+			if (value <= XFER3_MAX_BLOCK_SIZE) {
+				xfer3_block_size = value;
+			} else {
+				xfer3_block_size = XFER3_MAX_BLOCK_SIZE;
+			}
+		}
+		fclose(file);
+	}
+
+	return xfer3_block_size;
+}
 
 PyDoc_STRVAR(SpiDev_module_doc,
 	"This module defines an object type that allows SPI transactions\n"
@@ -63,6 +111,7 @@ typedef struct {
 	uint8_t mode;	/* current SPI mode */
 	uint8_t bits_per_word;	/* current SPI bits per word setting */
 	uint32_t max_speed_hz;	/* current SPI max speed setting in Hz */
+	uint8_t read0;	/* read 0 bytes after transfer to lwoer CS if SPI_CS_HIGH */
 } SpiDevObject;
 
 static PyObject *
@@ -114,6 +163,8 @@ SpiDev_dealloc(SpiDevObject *self)
 static char *wrmsg_list0 = "Empty argument list.";
 static char *wrmsg_listmax = "Argument list size exceeds %d bytes.";
 static char *wrmsg_val = "Non-Int/Long value in arguments: %x.";
+static char *wrmsg_oom = "Out of memory.";
+
 
 PyDoc_STRVAR(SpiDev_write_doc,
 	"write([values]) -> None\n\n"
@@ -133,7 +184,7 @@ SpiDev_writebytes(SpiDevObject *self, PyObject *args)
 		return NULL;
 
 	seq = PySequence_Fast(obj, "expected a sequence");
-	len = PySequence_Fast_GET_SIZE(obj);
+	len = PySequence_Fast_GET_SIZE(seq);
 	if (!seq || len <= 0) {
 		PyErr_SetString(PyExc_TypeError, wrmsg_list0);
 		return NULL;
@@ -217,11 +268,185 @@ SpiDev_readbytes(SpiDevObject *self, PyObject *args)
 	list = PyList_New(len);
 
 	for (ii = 0; ii < len; ii++) {
-		PyObject *val = Py_BuildValue("l", (long)rxbuf[ii]);
-		PyList_SET_ITEM(list, ii, val);
+		PyObject *val = PyLong_FromLong((long)rxbuf[ii]);
+		PyList_SET_ITEM(list, ii, val);  // Steals reference, no need to Py_DECREF(val)
 	}
 
 	return list;
+}
+
+static PyObject *
+SpiDev_writebytes2_buffer(SpiDevObject *self, Py_buffer *buffer)
+{
+	int		status;
+	Py_ssize_t	remain, block_size, block_start, spi_max_block;
+
+	spi_max_block = get_xfer3_block_size();
+
+	block_start = 0;
+	remain = buffer->len;
+	while (block_start < buffer->len) {
+		block_size = (remain < spi_max_block) ? remain : spi_max_block;
+
+		Py_BEGIN_ALLOW_THREADS
+		status = write(self->fd, buffer->buf + block_start, block_size);
+		Py_END_ALLOW_THREADS
+
+		if (status < 0) {
+			PyErr_SetFromErrno(PyExc_IOError);
+			return NULL;
+		}
+
+		if (status != block_size) {
+			perror("short write");
+			return NULL;
+		}
+
+		block_start += block_size;
+		remain -= block_size;
+	}
+
+	Py_INCREF(Py_None);
+	return Py_None;
+}
+
+static PyObject *
+SpiDev_writebytes2_seq_internal(SpiDevObject *self, PyObject *seq, Py_ssize_t len, uint8_t *buf, Py_ssize_t bufsize)
+{
+	int		status;
+	Py_ssize_t	ii, jj, remain, block_size;
+	char	wrmsg_text[4096];
+
+	remain = len;
+	jj = 0;
+	while (remain > 0) {
+		block_size = (remain < bufsize) ? remain : bufsize;
+
+		for (ii = 0; ii < block_size; ii++, jj++) {
+			PyObject *val = PySequence_Fast_GET_ITEM(seq, jj);
+#if PY_MAJOR_VERSION < 3
+			if (PyInt_Check(val)) {
+				buf[ii] = (__u8)PyInt_AS_LONG(val);
+			} else
+#endif
+			{
+				if (PyLong_Check(val)) {
+					buf[ii] = (__u8)PyLong_AS_LONG(val);
+				} else {
+					snprintf(wrmsg_text, sizeof (wrmsg_text) - 1, wrmsg_val, val);
+					PyErr_SetString(PyExc_TypeError, wrmsg_text);
+					return NULL;
+				}
+			}
+		}
+
+		Py_BEGIN_ALLOW_THREADS
+		status = write(self->fd, buf, block_size);
+		Py_END_ALLOW_THREADS
+
+		if (status < 0) {
+			PyErr_SetFromErrno(PyExc_IOError);
+			return NULL;
+		}
+
+		if (status != block_size) {
+			perror("short write");
+			return NULL;
+		}
+
+		remain -= block_size;
+	}
+
+	Py_INCREF(Py_None);
+	return Py_None;
+}
+
+// In writebytes2 we try to avoild doing malloc/free on each tiny block.
+// So for any transfer below this size we will use on-stack local buffer instead of allocating one on the heap.
+#define SMALL_BUFFER_SIZE 128
+
+static PyObject *
+SpiDev_writebytes2_seq(SpiDevObject *self, PyObject *seq)
+{
+	Py_ssize_t	len, bufsize, spi_max_block;
+	PyObject	*result = NULL;
+
+	len = PySequence_Fast_GET_SIZE(seq);
+	if (len <= 0) {
+		PyErr_SetString(PyExc_TypeError, wrmsg_list0);
+		return NULL;
+	}
+
+	spi_max_block = get_xfer3_block_size();
+
+	bufsize = (len < spi_max_block) ? len : spi_max_block;
+
+	if (bufsize <= SMALL_BUFFER_SIZE) {
+		// The data size is very small so we can avoid malloc/free completely
+		// by using a small local buffer instead
+		uint8_t buf[SMALL_BUFFER_SIZE];
+		result = SpiDev_writebytes2_seq_internal(self, seq, len, buf, SMALL_BUFFER_SIZE);
+	} else {
+		// Large data, need to allocate buffer on heap
+		uint8_t	*buf;
+		Py_BEGIN_ALLOW_THREADS
+		buf = malloc(sizeof(__u8) * bufsize);
+		Py_END_ALLOW_THREADS
+
+		if (!buf) {
+			PyErr_SetString(PyExc_OverflowError, wrmsg_oom);
+			return NULL;
+		}
+
+		result = SpiDev_writebytes2_seq_internal(self, seq, len, buf, bufsize);
+
+		Py_BEGIN_ALLOW_THREADS
+		free(buf);
+		Py_END_ALLOW_THREADS
+	}
+
+	return result;
+}
+
+PyDoc_STRVAR(SpiDev_writebytes2_doc,
+	"writebytes2([values]) -> None\n\n"
+	"Write bytes to SPI device.\n"
+	"values must be a list or buffer.\n");
+
+static PyObject *
+SpiDev_writebytes2(SpiDevObject *self, PyObject *args)
+{
+	PyObject	*obj, *seq;;
+	PyObject	*result = NULL;
+
+	if (!PyArg_ParseTuple(args, "O:writebytes2", &obj)) {
+		return NULL;
+	}
+
+	// Try using buffer protocol if object supports it.
+	if (PyObject_CheckBuffer(obj) && 1) {
+		Py_buffer	buffer;
+		if (PyObject_GetBuffer(obj, &buffer, PyBUF_SIMPLE) != -1) {
+			result = SpiDev_writebytes2_buffer(self, &buffer);
+			PyBuffer_Release(&buffer);
+			return result;
+		}
+	}
+
+
+	// Otherwise, fall back to sequence protocol
+	seq = PySequence_Fast(obj, "expected a sequence");
+	if (seq == NULL) {
+		PyErr_SetString(PyExc_TypeError, wrmsg_list0);
+		return NULL;
+	}
+
+	result = SpiDev_writebytes2_seq(self, seq);
+
+	Py_DECREF(seq);
+
+	return result;
+
 }
 
 PyDoc_STRVAR(SpiDev_xfer_doc,
@@ -254,8 +479,14 @@ SpiDev_xfer(SpiDevObject *self, PyObject *args)
 		return NULL;
 
 	seq = PySequence_Fast(obj, "expected a sequence");
-	len = PySequence_Fast_GET_SIZE(obj);
-	if (!seq || len <= 0) {
+	if (!seq) {
+		PyErr_SetString(PyExc_TypeError, wrmsg_list0);
+		return NULL;
+	}
+
+	len = PySequence_Fast_GET_SIZE(seq);
+	if (len <= 0) {
+		Py_DECREF(seq);
 		PyErr_SetString(PyExc_TypeError, wrmsg_list0);
 		return NULL;
 	}
@@ -263,6 +494,7 @@ SpiDev_xfer(SpiDevObject *self, PyObject *args)
 	if (len > SPIDEV_MAXPATH) {
 		snprintf(wrmsg_text, sizeof(wrmsg_text) - 1, wrmsg_listmax, SPIDEV_MAXPATH);
 		PyErr_SetString(PyExc_OverflowError, wrmsg_text);
+		Py_DECREF(seq);
 		return NULL;
 	}
 
@@ -278,7 +510,7 @@ SpiDev_xfer(SpiDevObject *self, PyObject *args)
 		if (PyInt_Check(val)) {
 			txbuf[ii] = (__u8)PyInt_AS_LONG(val);
 		} else
-#endif	// PY_MAJOR_VERSION
+#endif
 		{
 			if (PyLong_Check(val)) {
 				txbuf[ii] = (__u8)PyLong_AS_LONG(val);
@@ -288,39 +520,41 @@ SpiDev_xfer(SpiDevObject *self, PyObject *args)
 				free(xferptr);
 				free(txbuf);
 				free(rxbuf);
+				Py_DECREF(seq);
 				return NULL;
 			}
 		}
 		xferptr[ii].tx_buf = (unsigned long)&txbuf[ii];
 		xferptr[ii].rx_buf = (unsigned long)&rxbuf[ii];
 		xferptr[ii].len = 1;
-		xferptr[ii].delay_usecs = delay_usecs;
+		xferptr[ii].delay_usecs = delay;
 		xferptr[ii].speed_hz = speed_hz ? speed_hz : self->max_speed_hz;
 		xferptr[ii].bits_per_word = bits_per_word ? bits_per_word : self->bits_per_word;
 #ifdef SPI_IOC_WR_MODE32
 		xferptr[ii].tx_nbits = 0;
-#endif	// SPI_IOC_WR_MODE32
+#endif
 #ifdef SPI_IOC_RD_MODE32
 		xferptr[ii].rx_nbits = 0;
-#endif	// SPI_IOC_RD_MODE32
+#endif
 	}
 
 	status = ioctl(self->fd, SPI_IOC_MESSAGE(len), xferptr);
+	free(xferptr);
 	if (status < 0) {
 		PyErr_SetFromErrno(PyExc_IOError);
-		free(xferptr);
 		free(txbuf);
 		free(rxbuf);
+		Py_DECREF(seq);
 		return NULL;
 	}
-#else	// not SPIDEV_SINGLE
+#else
 	for (ii = 0; ii < len; ii++) {
 		PyObject *val = PySequence_Fast_GET_ITEM(seq, ii);
 #if PY_MAJOR_VERSION < 3
 		if (PyInt_Check(val)) {
 			txbuf[ii] = (__u8)PyInt_AS_LONG(val);
 		} else
-#endif	// PY_MAJOR_VERSION
+#endif
 		{
 			if (PyLong_Check(val)) {
 				txbuf[ii] = (__u8)PyLong_AS_LONG(val);
@@ -329,6 +563,7 @@ SpiDev_xfer(SpiDevObject *self, PyObject *args)
 				PyErr_SetString(PyExc_TypeError, wrmsg_text);
 				free(txbuf);
 				free(rxbuf);
+				Py_DECREF(seq);
 				return NULL;
 			}
 		}
@@ -347,23 +582,25 @@ SpiDev_xfer(SpiDevObject *self, PyObject *args)
 	xfer.bits_per_word = bits_per_word ? bits_per_word : self->bits_per_word;
 #ifdef SPI_IOC_WR_MODE32
 	xfer.tx_nbits = 0;
-#endif	// SPI_IOC_WR_MODE32
+#endif
 #ifdef SPI_IOC_RD_MODE32
 	xfer.rx_nbits = 0;
-#endif	// SPI_IOC_RD_MODE32
+#endif
 
 	status = ioctl(self->fd, SPI_IOC_MESSAGE(1), &xfer);
 	if (status < 0) {
 		PyErr_SetFromErrno(PyExc_IOError);
 		free(txbuf);
 		free(rxbuf);
+		Py_DECREF(seq);
 		return NULL;
 	}
-#endif	// SPIDEV_SINGLE
+#endif
 
 	for (ii = 0; ii < len; ii++) {
-		PyObject *val = Py_BuildValue("l", (long)rxbuf[ii]);
+		PyObject *val = PyLong_FromLong((long)rxbuf[ii]);
 		PySequence_SetItem(seq, ii, val);
+		Py_DECREF(val); // PySequence_SetItem does not steal reference, must Py_DECREF(val)
 	}
 
 	// WA:
@@ -371,7 +608,7 @@ SpiDev_xfer(SpiDevObject *self, PyObject *args)
 	// reading 0 bytes doesnt matter but brings cs down
 	// tomdean:
 	// Stop generating an extra CS except in mode CS_HOGH
-	if (self->mode & SPI_CS_HIGH) status = read(self->fd, &rxbuf[0], 0);
+	if (self->read0 && (self->mode & SPI_CS_HIGH)) status = read(self->fd, &rxbuf[0], 0);
 
 	free(txbuf);
 	free(rxbuf);
@@ -412,8 +649,14 @@ SpiDev_xfer2(SpiDevObject *self, PyObject *args)
 		return NULL;
 
 	seq = PySequence_Fast(obj, "expected a sequence");
-	len = PySequence_Fast_GET_SIZE(obj);
-	if (!seq || len <= 0) {
+	if (!seq) {
+		PyErr_SetString(PyExc_TypeError, wrmsg_list0);
+		return NULL;
+	}
+
+	len = PySequence_Fast_GET_SIZE(seq);
+	if (len <= 0) {
+		Py_DECREF(seq);
 		PyErr_SetString(PyExc_TypeError, wrmsg_list0);
 		return NULL;
 	}
@@ -421,6 +664,7 @@ SpiDev_xfer2(SpiDevObject *self, PyObject *args)
 	if (len > SPIDEV_MAXPATH) {
 		snprintf(wrmsg_text, sizeof(wrmsg_text) - 1, wrmsg_listmax, SPIDEV_MAXPATH);
 		PyErr_SetString(PyExc_OverflowError, wrmsg_text);
+		Py_DECREF(seq);
 		return NULL;
 	}
 
@@ -444,6 +688,7 @@ SpiDev_xfer2(SpiDevObject *self, PyObject *args)
 				PyErr_SetString(PyExc_TypeError, wrmsg_text);
 				free(txbuf);
 				free(rxbuf);
+				Py_DECREF(seq);
 				return NULL;
 			}
 		}
@@ -468,19 +713,21 @@ SpiDev_xfer2(SpiDevObject *self, PyObject *args)
 		PyErr_SetFromErrno(PyExc_IOError);
 		free(txbuf);
 		free(rxbuf);
+		Py_DECREF(seq);
 		return NULL;
 	}
 
 	for (ii = 0; ii < len; ii++) {
-		PyObject *val = Py_BuildValue("l", (long)rxbuf[ii]);
+		PyObject *val = PyLong_FromLong((long)rxbuf[ii]);
 		PySequence_SetItem(seq, ii, val);
+		Py_DECREF(val); // PySequence_SetItem does not steal reference, must Py_DECREF(val)
 	}
 	// WA:
 	// in CS_HIGH mode CS isnt pulled to low after transfer
 	// reading 0 bytes doesn't really matter but brings CS down
 	// tomdean:
 	// Stop generating an extra CS except in mode CS_HOGH
-	if (self->mode & SPI_CS_HIGH) status = read(self->fd, &rxbuf[0], 0);
+	if (self->read0 && (self->mode & SPI_CS_HIGH)) status = read(self->fd, &rxbuf[0], 0);
 
 	Py_BEGIN_ALLOW_THREADS
 	free(txbuf);
@@ -497,11 +744,10 @@ SpiDev_xfer2(SpiDevObject *self, PyObject *args)
 	return seq;
 }
 
-//It would look like this: values = spi.xfer3([<list of bytes to write>], <number of bytes to read>)
-//so in the case from the previous post: values = spi.xfer3([0x80,0xD9], 2)
 PyDoc_STRVAR(SpiDev_xfer3_doc,
-	"xfer3([write values],[bytes to read]) -> [read values]\n\n"
-	"Perform subsequent duplex-SPI transaction (write address, read response).\n"
+	"xfer3([values]) -> [values]\n\n"
+	"Perform SPI transaction. Accepts input of arbitrary size.\n"
+	"Large blocks will be send as multiple transactions\n"
 	"CS will be held active between blocks.\n");
 
 static PyObject *
@@ -509,124 +755,141 @@ SpiDev_xfer3(SpiDevObject *self, PyObject *args)
 {
 	int status;
 	uint16_t delay_usecs = 0;
-	uint32_t read_len = 0; //Length of bytes to read
 	uint32_t speed_hz = 0;
 	uint8_t bits_per_word = 0;
-	uint16_t ii, write_len;
+	Py_ssize_t ii, jj, len, block_size, block_start, bufsize;
 	PyObject *obj;
 	PyObject *seq;
-	PyObject	*list;
-	struct spi_ioc_transfer xfer[2];
+	PyObject *rx_tuple;
+	struct spi_ioc_transfer xfer;
 	Py_BEGIN_ALLOW_THREADS
 	memset(&xfer, 0, sizeof(xfer));
 	Py_END_ALLOW_THREADS
 	uint8_t *txbuf, *rxbuf;
 	char	wrmsg_text[4096];
 
-	if (!PyArg_ParseTuple(args, "OI|IHB:xfer3", &obj, &read_len, &speed_hz, &delay_usecs, &bits_per_word))
+	if (!PyArg_ParseTuple(args, "O|IHB:xfer3", &obj, &speed_hz, &delay_usecs, &bits_per_word))
 		return NULL;
 
 	seq = PySequence_Fast(obj, "expected a sequence");
-	write_len = PySequence_Fast_GET_SIZE(obj);
-	if (!seq || write_len <= 0) {
+	if (!seq) {
 		PyErr_SetString(PyExc_TypeError, wrmsg_list0);
 		return NULL;
 	}
 
-	if (write_len > SPIDEV_MAXPATH) {
-		snprintf(wrmsg_text, sizeof(wrmsg_text) - 1, wrmsg_listmax, SPIDEV_MAXPATH);
-		PyErr_SetString(PyExc_OverflowError, wrmsg_text);
+	len = PySequence_Fast_GET_SIZE(seq);
+	if (len <= 0) {
+		Py_DECREF(seq);
+		PyErr_SetString(PyExc_TypeError, wrmsg_list0);
+		return NULL;
+	}
+
+	bufsize = get_xfer3_block_size();
+	if (bufsize > len) {
+		bufsize = len;
+	}
+
+	rx_tuple = PyTuple_New(len);
+	if (!rx_tuple) {
+		Py_DECREF(seq);
+		PyErr_SetString(PyExc_OverflowError, wrmsg_oom);
 		return NULL;
 	}
 
 	Py_BEGIN_ALLOW_THREADS
-	// The malloc-ed length would be based on the length of the input list AND the number of bytes to be read
-	txbuf = malloc(sizeof(__u8) * write_len);	// writing the bytes from input object
-	rxbuf = malloc(sizeof(__u8) * read_len);	// reading number of specified bytes
+	// Allocate tx and rx buffers immediately releasing them if any allocation fails
+	if ((txbuf = malloc(sizeof(__u8) * bufsize)) != NULL) {
+		if ((rxbuf = malloc(sizeof(__u8) * bufsize)) != NULL) {
+			// All good, both buffers allocated
+		} else {
+			// rxbuf allocation failed while txbuf succeeded
+			free(txbuf);
+			txbuf = NULL;
+		}
+	} else {
+		// txbuf allocation failed
+		rxbuf = NULL;
+	}
 	Py_END_ALLOW_THREADS
-	// There would be a loop to populate xferptr elements with the bytes
-	// that should be written - along with nothing in the rx_buf element
-	for (ii = 0; ii < write_len; ii++) {
-		PyObject *val = PySequence_Fast_GET_ITEM(seq, ii);
+	if (!txbuf || !rxbuf) {
+		// Allocation failed. Buffers has been freed already
+		Py_DECREF(seq);
+		Py_DECREF(rx_tuple);
+		PyErr_SetString(PyExc_OverflowError, wrmsg_oom);
+		return NULL;
+	}
+
+
+	block_start = 0;
+	while (block_start < len) {
+
+		for (ii = 0, jj = block_start; jj < len && ii < bufsize; ii++, jj++) {
+			PyObject *val = PySequence_Fast_GET_ITEM(seq, jj);
 #if PY_MAJOR_VERSION < 3
-		if (PyInt_Check(val)) {
-			txbuf[ii] = (__u8)PyInt_AS_LONG(val);
-		} else
+			if (PyInt_Check(val)) {
+				txbuf[ii] = (__u8)PyInt_AS_LONG(val);
+			} else
 #endif
-		{
-			if (PyLong_Check(val)) {
-				txbuf[ii] = (__u8)PyLong_AS_LONG(val);
-			} else {
-				snprintf(wrmsg_text, sizeof (wrmsg_text) - 1, wrmsg_val, val);
-				PyErr_SetString(PyExc_TypeError, wrmsg_text);
-				free(txbuf);
-				free(rxbuf);
-				return NULL;
+			{
+				if (PyLong_Check(val)) {
+					txbuf[ii] = (__u8)PyLong_AS_LONG(val);
+				} else {
+					snprintf(wrmsg_text, sizeof (wrmsg_text) - 1, wrmsg_val, val);
+					PyErr_SetString(PyExc_TypeError, wrmsg_text);
+					free(txbuf);
+					free(rxbuf);
+					Py_DECREF(rx_tuple);
+					Py_DECREF(seq);
+					return NULL;
+				}
 			}
 		}
+
+		block_size = ii;
+
+		Py_BEGIN_ALLOW_THREADS
+		xfer.tx_buf = (unsigned long)txbuf;
+		xfer.rx_buf = (unsigned long)rxbuf;
+		xfer.len = block_size;
+		xfer.delay_usecs = delay_usecs;
+		xfer.speed_hz = speed_hz ? speed_hz : self->max_speed_hz;
+		xfer.bits_per_word = bits_per_word ? bits_per_word : self->bits_per_word;
+
+		status = ioctl(self->fd, SPI_IOC_MESSAGE(1), &xfer);
+		Py_END_ALLOW_THREADS
+
+		if (status < 0) {
+			PyErr_SetFromErrno(PyExc_IOError);
+			free(txbuf);
+			free(rxbuf);
+			Py_DECREF(rx_tuple);
+			Py_DECREF(seq);
+			return NULL;
+		}
+		for (ii = 0, jj = block_start; ii < block_size; ii++, jj++) {
+			PyObject *val = PyLong_FromLong((long)rxbuf[ii]);
+			PyTuple_SetItem(rx_tuple, jj, val);  // Steals reference, no need to Py_DECREF(val)
+		}
+
+		block_start += block_size;
 	}
 
-	if (PyTuple_Check(obj)) {
-		Py_DECREF(seq);
-		seq = PySequence_List(obj);
-	}
-
-	Py_BEGIN_ALLOW_THREADS
-	xfer[0].tx_buf = (unsigned long) txbuf;
-	xfer[1].rx_buf = (unsigned long) rxbuf;
-	xfer[0].len = write_len;
-	xfer[1].len = read_len;
-	xfer[0].cs_change = 0;
-	//xfer[1].cs_change = SPI_CS_CHANGE;
-	xfer[1].cs_change = 0;
-	
-	xfer[0].delay_usecs = delay_usecs;
-	xfer[1].delay_usecs = delay_usecs;
-	xfer[0].speed_hz = speed_hz ? speed_hz : self->max_speed_hz;
-	xfer[1].speed_hz = speed_hz ? speed_hz : self->max_speed_hz;
-	xfer[0].bits_per_word = bits_per_word ? bits_per_word : self->bits_per_word;
-	xfer[1].bits_per_word = bits_per_word ? bits_per_word : self->bits_per_word;
-
-	status = ioctl(self->fd, SPI_IOC_MESSAGE(2), &xfer);
-	Py_END_ALLOW_THREADS
-	if (status < 0) {
-		PyErr_SetFromErrno(PyExc_IOError);
-		free(txbuf);
-		free(rxbuf);
-		return NULL;
-	}
-	
-	// Create output sequence with read_len bytes
-	list = PyList_New(read_len);
-	for (ii = 0; ii < read_len; ii++) {
-		PyObject *val = Py_BuildValue("l", (long)rxbuf[ii]);
-		PyList_SET_ITEM(list, ii, val);
-	}
-
-	
 
 	// WA:
 	// in CS_HIGH mode CS isnt pulled to low after transfer
 	// reading 0 bytes doesn't really matter but brings CS down
 	// tomdean:
 	// Stop generating an extra CS except in mode CS_HIGH
-	if (self->mode & SPI_CS_HIGH) status = read(self->fd, &rxbuf[0], 0);
+	if (self->read0 && (self->mode & SPI_CS_HIGH)) status = read(self->fd, &rxbuf[0], 0);
 
 	Py_BEGIN_ALLOW_THREADS
 	free(txbuf);
 	free(rxbuf);
 	Py_END_ALLOW_THREADS
 
-	// Free input sequence object
-	// for reference counting
-	// TODO: does this still count the seq object as a reference?
-	if (PyTuple_Check(obj)) {
-		PyObject *old = seq;
-		Py_DECREF(old);
-	}
+	Py_DECREF(seq);
 
-	// Return new list of values read
-	return list;
+	return rx_tuple;
 }
 
 static int __spidev_set_mode( int fd, __u8 mode) {
@@ -640,6 +903,9 @@ static int __spidev_set_mode( int fd, __u8 mode) {
 		return -1;
 	}
 	if (test != mode) {
+		PyErr_Format(PyExc_IOError,
+			"Attempted to set mode 0x%x but mode 0x%x returned",
+			(unsigned int)mode, (unsigned int)test);
 		return -1;
 	}
 	return 0;
@@ -740,6 +1006,7 @@ static int
 SpiDev_set_mode(SpiDevObject *self, PyObject *val, void *closure)
 {
 	uint8_t mode, tmp;
+	int ret;
 
 	if (val == NULL) {
 		PyErr_SetString(PyExc_TypeError,
@@ -772,16 +1039,18 @@ SpiDev_set_mode(SpiDevObject *self, PyObject *val, void *closure)
 	// clean and set CPHA and CPOL bits
 	tmp = ( self->mode & ~(SPI_CPHA | SPI_CPOL) ) | mode ;
 
-	__spidev_set_mode(self->fd, tmp);
+	ret = __spidev_set_mode(self->fd, tmp);
 
-	self->mode = tmp;
-	return 0;
+	if (ret != -1)
+		self->mode = tmp;
+	return ret;
 }
 
 static int
 SpiDev_set_cshigh(SpiDevObject *self, PyObject *val, void *closure)
 {
 	uint8_t tmp;
+	int ret;
 
 	if (val == NULL) {
 		PyErr_SetString(PyExc_TypeError,
@@ -799,16 +1068,18 @@ SpiDev_set_cshigh(SpiDevObject *self, PyObject *val, void *closure)
 	else
 		tmp = self->mode & ~SPI_CS_HIGH;
 
-	__spidev_set_mode(self->fd, tmp);
+	ret = __spidev_set_mode(self->fd, tmp);
 
-	self->mode = tmp;
-	return 0;
+	if (ret != -1)
+		self->mode = tmp;
+	return ret;
 }
 
 static int
 SpiDev_set_lsbfirst(SpiDevObject *self, PyObject *val, void *closure)
 {
 	uint8_t tmp;
+	int ret;
 
 	if (val == NULL) {
 		PyErr_SetString(PyExc_TypeError,
@@ -826,16 +1097,18 @@ SpiDev_set_lsbfirst(SpiDevObject *self, PyObject *val, void *closure)
 	else
 		tmp = self->mode & ~SPI_LSB_FIRST;
 
-	__spidev_set_mode(self->fd, tmp);
+	ret = __spidev_set_mode(self->fd, tmp);
 
-	self->mode = tmp;
-	return 0;
+	if (ret != -1)
+		self->mode = tmp;
+	return ret;
 }
 
 static int
 SpiDev_set_3wire(SpiDevObject *self, PyObject *val, void *closure)
 {
 	uint8_t tmp;
+	int ret;
 
 	if (val == NULL) {
 		PyErr_SetString(PyExc_TypeError,
@@ -853,16 +1126,18 @@ SpiDev_set_3wire(SpiDevObject *self, PyObject *val, void *closure)
 	else
 		tmp = self->mode & ~SPI_3WIRE;
 
-	__spidev_set_mode(self->fd, tmp);
+	ret = __spidev_set_mode(self->fd, tmp);
 
-	self->mode = tmp;
-	return 0;
+	if (ret != -1)
+		self->mode = tmp;
+	return ret;
 }
 
 static int
 SpiDev_set_no_cs(SpiDevObject *self, PyObject *val, void *closure)
 {
         uint8_t tmp;
+	int ret;
 
         if (val == NULL) {
                 PyErr_SetString(PyExc_TypeError,
@@ -880,10 +1155,11 @@ SpiDev_set_no_cs(SpiDevObject *self, PyObject *val, void *closure)
         else
                 tmp = self->mode & ~SPI_NO_CS;
 
-        __spidev_set_mode(self->fd, tmp);
+        ret = __spidev_set_mode(self->fd, tmp);
 
-        self->mode = tmp;
-        return 0;
+	if (ret != -1)
+		self->mode = tmp;
+        return ret;
 }
 
 
@@ -891,6 +1167,7 @@ static int
 SpiDev_set_loop(SpiDevObject *self, PyObject *val, void *closure)
 {
 	uint8_t tmp;
+	int ret;
 
 	if (val == NULL) {
 		PyErr_SetString(PyExc_TypeError,
@@ -908,10 +1185,11 @@ SpiDev_set_loop(SpiDevObject *self, PyObject *val, void *closure)
 	else
 		tmp = self->mode & ~SPI_LOOP;
 
-	__spidev_set_mode(self->fd, tmp);
+	ret = __spidev_set_mode(self->fd, tmp);
 
-	self->mode = tmp;
-	return 0;
+	if (ret != -1)
+		self->mode = tmp;
+	return ret;
 }
 
 static PyObject *
@@ -947,9 +1225,9 @@ SpiDev_set_bits_per_word(SpiDevObject *self, PyObject *val, void *closure)
 		}
 	}
 
-		if (bits < 8 || bits > 16) {
+		if (bits < 8 || bits > 32) {
 		PyErr_SetString(PyExc_TypeError,
-			"invalid bits_per_word (8 to 16)");
+			"invalid bits_per_word (8 to 32)");
 		return -1;
 	}
 
@@ -1006,6 +1284,33 @@ SpiDev_set_max_speed_hz(SpiDevObject *self, PyObject *val, void *closure)
 	return 0;
 }
 
+static PyObject *
+SpiDev_get_read0(SpiDevObject *self, void *closure)
+{
+	PyObject *result = (self->read0 == 1) ? Py_True : Py_False;
+	Py_INCREF(result);
+	return result;
+}
+
+static int
+SpiDev_set_read0(SpiDevObject *self, PyObject *val, void *closure)
+{
+	if (val == NULL) {
+		PyErr_SetString(PyExc_TypeError,
+			"Cannot delete attribute");
+		return -1;
+	}
+	else if (!PyBool_Check(val)) {
+		PyErr_SetString(PyExc_TypeError,
+			"The read0 attribute must be boolean");
+		return -1;
+	}
+
+	self->read0 = (val == Py_True) ? 1 : 0;
+
+	return 0;
+}
+
 static PyGetSetDef SpiDev_getset[] = {
 	{"mode", (getter)SpiDev_get_mode, (setter)SpiDev_set_mode,
 			"SPI mode as two bit pattern of \n"
@@ -1025,6 +1330,8 @@ static PyGetSetDef SpiDev_getset[] = {
 			"bits per word\n"},
 	{"max_speed_hz", (getter)SpiDev_get_max_speed_hz, (setter)SpiDev_set_max_speed_hz,
 			"maximum speed in Hz\n"},
+	{"read0", (getter)SpiDev_get_read0, (setter)SpiDev_set_read0,
+			"Read 0 bytes after transfer to lower CS if cshigh == True\n"},
 	{NULL},
 };
 
@@ -1135,6 +1442,8 @@ static PyMethodDef SpiDev_methods[] = {
 		SpiDev_read_doc},
 	{"writebytes", (PyCFunction)SpiDev_writebytes, METH_VARARGS,
 		SpiDev_write_doc},
+	{"writebytes2", (PyCFunction)SpiDev_writebytes2, METH_VARARGS,
+		SpiDev_writebytes2_doc},
 	{"xfer", (PyCFunction)SpiDev_xfer, METH_VARARGS,
 		SpiDev_xfer_doc},
 	{"xfer2", (PyCFunction)SpiDev_xfer2, METH_VARARGS,
@@ -1251,3 +1560,4 @@ void initspidev(void)
 	return m;
 #endif
 }
+
